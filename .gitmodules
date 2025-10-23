@@ -1,0 +1,3 @@
+[submodule "endpoint"]
+	path = endpoint
+	url = https://github.com/johanesPao/etp-scraper-payloads-and-enums.git
