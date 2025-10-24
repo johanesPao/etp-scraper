@@ -1,19 +1,35 @@
 import polars as pl
 import time
+from typing import Any
 from endpoint.rekues import Request
-from endpoint.dict_type import T_Product
+from endpoint.dict_type import T_Product, T_ProductAlias
 from endpoint.enums import ActionId, Attribute
 
 
-def all_products(rekues: Request, limit: int | None = None) -> pl.DataFrame:
-    id_terunduh: set[int] = set()
-    semua_produk: list[T_Product] = []
+def id_pencarian(action: ActionId) -> Attribute | None:
+    match action:
+        case ActionId.GET_ALL_PRODUCTS:
+            return Attribute.PRODUCT_ID
+        case ActionId.GET_PRODUCT_ALIAS:
+            return Attribute.PRODUCT_ID_ALIAS
+    return None
+
+
+def ambil_data(
+    rekues: Request, action: ActionId, limit: int | None = None
+) -> pl.DataFrame:
+    id_terunduh: set[Any] = set()
+    semua_produk: list[T_Product | T_ProductAlias] = []
     offset_halaman = 0
     ronde_kosong = 0
 
+    atribut_id = id_pencarian(action)
+    if atribut_id is None:
+        raise ValueError(f"Atribut ID pencarian tidak ditemukan untuk action {action}")
+
     while True:
         try:
-            batch = rekues.fetch_batch_req(ActionId.GET_ALL_PRODUCTS, offset_halaman)
+            batch = rekues.fetch_batch_req(action, offset_halaman)
         except Exception as e:
             print(
                 f"Terjadi kesalahan rekues pada halaman {offset_halaman}: {e}. Mencoba lagi..."
@@ -22,16 +38,14 @@ def all_products(rekues: Request, limit: int | None = None) -> pl.DataFrame:
             continue
 
         # Mengambil produk unik dari batch yang belum terunduh
-        produk_baru = [
-            p for p in batch if p.get(Attribute.PRODUCT_ID.value) not in id_terunduh
-        ]
+        produk_baru = [p for p in batch if p.get(atribut_id) not in id_terunduh]
 
         if produk_baru:
             # Rest ronde_kosong jika ada produk baru
             ronde_kosong = 0
             # Tambahkan hanya produk baru ke id_terunduh dan semua_produk
             for p in produk_baru:
-                pid = p.get(Attribute.PRODUCT_ID.value)
+                pid = p.get(atribut_id)
                 if pid not in id_terunduh:
                     id_terunduh.add(pid)
                     semua_produk.append(p)
