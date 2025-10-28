@@ -1,9 +1,11 @@
+import asyncio
+import aiohttp
 import polars as pl
 import time
 from typing import Any
 import os
 import json
-from endpoint.rekues import Request
+from endpoint.rekues import RequestAsinkron
 from endpoint.dict_type import T_Product, T_ProductAlias
 from endpoint.enums import ActionId, Attribute
 
@@ -25,8 +27,11 @@ def output_json(data: pl.DataFrame, nama_file: str) -> None:
         json.dump(data.to_dicts(), f, ensure_ascii=False, indent=4)
 
 
-def ambil_data(
-    rekues: Request, action: ActionId, limit: int | None = None
+async def ambil_data(
+    rekues: RequestAsinkron,
+    action: ActionId,
+    limit: int | None = None,
+    konkurensi: int = 20,
 ) -> pl.DataFrame:
     data_id_terunduh: set[Any] = set()
     semua_data: list[T_Product | T_ProductAlias] = []
@@ -39,61 +44,60 @@ def ambil_data(
             f"[{action.name}] Atribut ID pencarian tidak ditemukan untuk action {action}"
         )
 
-    while True:
-        try:
-            batch = rekues.fetch_batch_req(action, offset_halaman)
-        except Exception as e:
-            print(
-                f"[{action.name}] Terjadi kesalahan rekues pada halaman {offset_halaman}: {e}. Mencoba lagi..."
-            )
-            time.sleep(2)
-            continue
+    waktu_mulai = time.time()
 
-        # Mengambil data unik dari batch yang belum terunduh
-        data_baru = [d for d in batch if d.get(data_id) not in data_id_terunduh]
+    async with aiohttp.ClientSession() as sesi:
+        while True:
+            list_offset = [
+                offset_halaman + rekues.JUMLAH_PER_HALAMAN * i
+                for i in range(konkurensi)
+            ]
 
-        if data_baru:
-            # Rest ronde_kosong jika ada data baru
+            # Menjalankan fetch multiple halaman secara konkuren
+            pekerjaan = [rekues.fetch_batch_req(sesi, action, o) for o in list_offset]
+            hasil = await asyncio.gather(*pekerjaan)
+
+            hasil_batch = [item for sublist in hasil for item in sublist if sublist]
+
+            if not hasil_batch:
+                ronde_kosong += 1
+                print(
+                    f"[{action.name}] Tidak ada data baru (ronde_kosong: {ronde_kosong}), berhenti jika melebihi batas (running time: {(time.time() - waktu_mulai):.2f} detik)"
+                )
+                if ronde_kosong >= rekues.MAKS_RONDE_KOSONG:
+                    break
+                await asyncio.sleep(0.5)
+                continue
+
             ronde_kosong = 0
-            # Tambahkan hanya data baru ke id_terunduh dan semua_data
+            data_baru = [
+                d for d in hasil_batch if d.get(data_id) not in data_id_terunduh
+            ]
+
             for d in data_baru:
                 did = d.get(data_id)
                 if did not in data_id_terunduh:
                     data_id_terunduh.add(did)
                     semua_data.append(d)
+
+            print(
+                f"[{action.name}] +{len(data_baru)} data baru, total {len(semua_data)} (offset: {offset_halaman}, running time: {(time.time() - waktu_mulai):.2f} detik)"
+            )
+
+            offset_halaman += rekues.JUMLAH_PER_HALAMAN * konkurensi
+
+            if limit and len(semua_data) >= limit:
                 print(
-                    f"[{action.name}] pageCount={offset_halaman} -> Ditemukan {len(batch)} data, {len(data_baru)} diantaranya adalah data baru, total data terkumpul: {len(semua_data)}"
+                    f"[{action.name}] Mencapai limit {limit}, berhenti (running time: {(time.time() - waktu_mulai):.2f} detik)"
                 )
-        else:
-            # Tambahkan ronde_kosong jika tidak ada data baru
-            ronde_kosong += 1
-            print(
-                f"[{action.name}] pageCount={offset_halaman} -> Ditemukan {len(batch)} data, tidak ada data baru (ronde_kosong: {ronde_kosong})"
-            )
+                break
 
-        # Kondisi terminasi
-        if not batch:
-            # Tidak ada data yang dikembalikan -> kemungkinan selesai
-            print(
-                f"[{action.name}] Tidak ada data yang dikembalikan. Mengakhiri proses pengunduhan."
-            )
-            break
+            await asyncio.sleep(0.2)
 
-        if ronde_kosong >= rekues.MAKS_RONDE_KOSONG:
-            print(
-                f"[{action.name}] Tidak ada data baru selama {rekues.MAKS_RONDE_KOSONG} ronde berturut-turut. Mengakhiri proses untuk mencegah infinite loop"
-            )
-
-        # Persiapan untuk iterasi berikutnya
-        offset_halaman += rekues.JUMLAH_PER_HALAMAN
-        # Cek batas limit jika diberikan
-        if limit and len(semua_data) >= limit:
-            print(
-                f"[{action.name}] Mencapai batas limit {limit} data. Mengakhiri proses pengunduhan."
-            )
-            break
-        # Throttling untuk menghindari hit rate limit
-        time.sleep(0.2)
+    total_waktu = time.time() - waktu_mulai
+    print(
+        f"\n[{action.name}] Selesai dalam {total_waktu:.2f} detik, total data {len(semua_data)}"
+    )
 
     output_json(
         pl.DataFrame(semua_data),
